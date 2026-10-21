@@ -1,0 +1,16 @@
+# Virtual environment
+venv/
+
+# Python cache and testing
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Training checkpoints and logs
+runs/
+models/
+
+# Video files (ignore everywhere except within results/)
+*.mp4
+!results/**
