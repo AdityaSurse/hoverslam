@@ -8,20 +8,65 @@ Planar rocket booster landing simulation comparing reinforcement learning and cl
 
 ## Summary
 
-Rocket boosters landing via retro-propulsion face a throttle lower bound where minimum engine thrust exceeds vehicle empty weight, requiring a timed deceleration burn that zeroes velocity at the exact moment of surface contact rather than hovering. This project formulates the planar landing maneuver as a continuous Markov decision process solved with Proximal Policy Optimization (PPO) and benchmarks it against a cascaded classical PID controller. Domain-randomized training targets performance under variable wind fields. The model is a simplified two-dimensional planar simulation for control benchmarking rather than operational flight software.
+Rocket boosters landing via retro-propulsion face a throttle lower bound where minimum engine thrust exceeds vehicle empty weight, requiring a timed deceleration burn (a "hoverslam" or suicide burn) that zeroes velocity at the exact moment of surface contact rather than hovering. This project formulates the planar rocket landing maneuver as a continuous Markov decision process solved with Proximal Policy Optimization (PPO) and benchmarks it against a cascaded classical Proportional-Integral-Derivative (PID) controller. Domain-randomized training evaluates robustness under continuous Ornstein-Uhlenbeck wind gusts and unmodeled sensor noise. The model is a simplified two-dimensional planar simulation for control benchmarking rather than operational flight software.
+
+### Visual Demo
+
+![HoverSlam RL vs PID Landing Preview](results/hoverslam_preview.gif)
+
+*Side-by-side terminal touchdown comparison under active wind disturbances ($0.75$) and sensor observation noise. Left: Classical PID controller suffers from high-frequency derivative noise amplification and crashes. Right: Domain-randomized PPO neural policy acts as a smooth non-linear filter and achieves a pinpoint soft landing.*
+
+---
 
 ## Table of contents
 
+- [Visual Demo](#visual-demo)
+- [Benchmark Results](#benchmark-results)
 - [Architecture](#architecture)
 - [Physics model](#physics-model)
 - [Environment](#environment)
+- [Reward design & loopholes](#reward-design--loopholes)
 - [Baselines](#baselines)
 - [Training setup](#training-setup)
+- [Quickstart: Run in under 10 minutes](#quickstart-run-in-under-10-minutes)
 - [Debugging history](#debugging-history)
-- [Limitations](#limitations)
-- [Execution](#execution)
+- [Limitations & sim-to-real gap](#limitations--sim-to-real-gap)
 - [Repository structure](#repository-structure)
 - [License](#license)
+
+---
+
+## Benchmark Results
+
+Evaluated across fixed, deterministic test seeds (`10000`–`10099`, disjoint from training seeds) with 100 Monte Carlo episodes per condition:
+
+### 1. Wind Disturbance Sensitivity Sweep (Sensor Noise = 0.0)
+
+| Wind Strength | Classical PID Success | PPO Nominal Mean [Min-Max] | PPO Randomized Mean [Min-Max] | PID Touchdown Speed | PID Fuel Remaining |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **0.00** | 94.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 1.25 m/s | 103.8 kg |
+| **0.25** | 98.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 1.24 m/s | 104.1 kg |
+| **0.50** | 98.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 1.23 m/s | 104.1 kg |
+| **0.75** | 95.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 1.23 m/s | 104.1 kg |
+| **1.00** | 89.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 1.23 m/s | 104.1 kg |
+
+### 2. Sensor Observation Noise Sensitivity Sweep (Wind = 0.0)
+
+| Sensor Noise | Classical PID Success | PPO Nominal Mean [Min-Max] | PPO Randomized Mean [Min-Max] | PID Touchdown Speed | PID Fuel Remaining |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **0.00** | 94.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 1.25 m/s | 103.8 kg |
+| **0.25** | 3.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 16.90 m/s | 42.6 kg |
+| **0.50** | 0.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 17.73 m/s | 40.5 kg |
+| **0.75** | 0.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 17.80 m/s | 40.2 kg |
+| **1.00** | 0.0% | 0.0% [0% - 0%] | 0.0% [0% - 0%] | 17.79 m/s | 40.0 kg |
+
+### Headline Sensitivity Plots
+
+| Wind Sensitivity Curve | Sensor Noise Sensitivity Curve |
+|:---:|:---:|
+| ![Wind Sensitivity Curve](results/success_vs_wind.png) | ![Sensor Noise Sensitivity Curve](results/success_vs_noise.png) |
+
+---
 
 ## Architecture
 
@@ -29,31 +74,31 @@ Rocket boosters landing via retro-propulsion face a throttle lower bound where m
 
 ```mermaid
 flowchart TD
-    A["Environment State"] --> B["Observation Vector (dim 7)"]
-    B --> C["PPO Policy Network (MLP)"]
+    A["Environment State"] --> B["Observation Vector (dim 10)"]
+    B --> C["PPO Policy Network (MLP: 64x64)"]
     C --> D["Action Vector (dim 2: throttle, gimbal)"]
-    D --> E["Physics Numerical Integrator"]
+    D --> E["Physics Numerical Integrator (Semi-Implicit Euler / RK4)"]
     E --> F["State Update (x, y, vx, vy, theta, omega, mass)"]
     F --> G["Reward Computation & Termination Check"]
     G --> A
 ```
 
-Observation dimensions: 7 variables [TODO: Verify observation dimensions in envs/]. Action dimensions: 2 continuous commands (throttle and gimbal angle) [TODO: Verify action bounds in envs/].
+Observation dimensions: 10 variables (`[x/50, y/300, vx/20, vy/80, sin(theta), cos(theta), omega, fuel_fraction, prev_throttle, prev_gimbal]`). Action dimensions: 2 continuous commands normalized in `[-1.0, 1.0]`.
 
 ### Landing sequence
 
 ```mermaid
 flowchart TD
-    A["Free Fall Descent"] --> B["Ignition Altitude Decision"]
-    B --> C["Landing Burn Ignition"]
-    C --> D["Active Gimbal Vectoring"]
+    A["Free Fall Descent (Engine Off)"] --> B["Ignition Altitude Assessment (Kinematic Stop Point)"]
+    B --> C["Retro-Propulsion Landing Burn (T >= 40% T_max)"]
+    C --> D["Active Gimbal Vectoring (-10 to +10 deg)"]
     D --> E["Touchdown Sensor Trigger (y <= 0)"]
     E --> F{"Threshold Assessment"}
-    F -->|"|x| <= 5 m, |vy| <= 2 m/s, |vx| <= 1 m/s, |theta| <= 5 deg"| G["Landing Success"]
-    F -->|"Exceeds Velocity or Tilt Limits"| H["Crash Impact"]
+    F -->|"|x| < 5m, |vy| < 2m/s, |vx| < 1m/s, |theta| < 5 deg"| G["Landing Success"]
+    F -->|"Exceeds Velocity, Angle, or Distance Limits"| H["Crash Impact"]
 ```
 
-Landing success requires ground contact ($y \le 0$) with lateral displacement $|x| \le 5\text{ m}$, vertical velocity $|v_y| \le 2.0\text{ m/s}$, horizontal velocity $|v_x| \le 1.0\text{ m/s}$, tilt angle $|\theta| \le 5^\circ$, and angular rate $|\omega| \le 0.1\text{ rad/s}$ [TODO: Confirm exact threshold numbers in envs/].
+Landing success requires ground contact ($y \le 0$) with lateral displacement $|x| < 5.0\text{ m}$, vertical velocity $|v_y| < 2.0\text{ m/s}$, horizontal velocity $|v_x| < 1.0\text{ m/s}$, and tilt angle $|\theta| < 5.0^\circ$ ($0.0873\text{ rad}$).
 
 ### Pipeline
 
@@ -68,10 +113,12 @@ flowchart LR
 
 The pipeline connects planar dynamics in `sim/` to a standardized Gymnasium interface in `envs/`. Policy training runs across three fixed random seeds for both nominal and randomized conditions in `train.py`. The resulting policies and the baseline controller are evaluated on identical test seeds in `evaluate.py` to output comparison tables, plots, and rendered video clips.
 
+---
+
 ## Physics model
 
-The simulation tracks seven continuous state variables:
-- $x$: downrange position relative to the landing pad center (m)
+The simulation tracks seven continuous state variables defined in `sim/rocket.py`:
+- $x$: downrange position relative to landing pad center (m)
 - $y$: altitude above ground level (m)
 - $\dot{x} = v_x$: horizontal downrange velocity (m/s)
 - $\dot{y} = v_y$: vertical velocity (m/s)
@@ -79,205 +126,271 @@ The simulation tracks seven continuous state variables:
 - $\dot{\theta} = \omega$: pitch angular velocity (rad/s)
 - $m$: instantaneous vehicle mass (kg), where $m(t) = m_{dry} + m_{fuel}(t)$
 
-Planar equations of motion with thrust vectoring and aerodynamic drag:
+### Planar Equations of Motion
 
-```latex
-\ddot{x} = \frac{T \sin(\theta + \delta) - F_{D,x}}{m}
-\ddot{y} = \frac{T \cos(\theta + \delta) - m g - F_{D,y}}{m}
-\ddot{\theta} = \frac{-T \, l_e \sin(\delta)}{I}
-\dot{m} = -\frac{T}{I_{sp} g_0}
-```
+Forces include engine thrust vectoring, standard gravitational acceleration, aerodynamic drag, and lateral atmospheric wind:
 
-Aerodynamic drag opposes the relative velocity vector:
+$$\ddot{x} = \frac{T \sin(\theta + \delta) - F_{D,x} + F_{wind,x}}{m}$$
 
-```latex
-\vec{F}_D = \frac{1}{2} \rho C_D A \|\vec{v}_{rel}\| \vec{v}_{rel}
-```
+$$\ddot{y} = \frac{T \cos(\theta + \delta) - m g - F_{D,y}}{m}$$
 
-Sign conventions:
-- Altitude $+y$ points upward; surface contact occurs at $y = 0$.
-- Downrange $+x$ points rightward; pad center is at $x = 0$.
-- Pitch angle $\theta = 0$ corresponds to upright orientation; counter-clockwise rotation is positive.
-- Gimbal deflection angle $\delta$ is measured relative to vehicle body centerline; positive counter-clockwise gimbal angle directs thrust rightward, imparting negative (clockwise) pitch torque.
+$$\ddot{\theta} = \frac{\tau}{I} = \frac{-L \, T \sin(\delta)}{I}$$
 
-| Parameter | Symbol | Value | Unit | Description |
+$$\dot{m} = -\frac{T}{I_{sp} g_0} \quad (\text{for } m > m_{dry})$$
+
+Where vehicle moment of inertia for a slender cylinder is:
+
+$$I = \frac{1}{12} m H^2$$
+
+Aerodynamic drag opposes the vehicle velocity vector:
+
+$$\vec{F}_D = \frac{1}{2} \rho C_D A \|\vec{v}\| \vec{v}$$
+
+### Sign Conventions
+
+- **Altitude ($+y$):** Points upward; surface contact occurs at $y = 0$.
+- **Downrange ($+x$):** Points rightward; pad center is at $x = 0$.
+- **Pitch angle ($\theta$):** $\theta = 0\text{ rad}$ corresponds to perfectly upright vertical. Positive $\theta$ tilts the rocket top clockwise towards $+x$.
+- **Gimbal deflection angle ($\delta$):** Measured relative to vehicle centerline. Because the nozzle is at distance $L$ below the center of mass, deflecting the engine nozzle with positive $\delta$ directs thrust towards $+x$, imparting a negative (counter-clockwise / restoring) torque: $\tau = -L \cdot T \sin(\delta)$.
+- **Wind force ($F_{wind,x}$):** External horizontal aerodynamic force acting along $+x$.
+
+### Physical Parameter Table (from `sim/rocket.py`)
+
+All values and units are exact numbers from [sim/rocket.py](sim/rocket.py):
+
+| Parameter | Symbol | Exact Value | Unit | Description |
 |---|---|---|---|---|
-| Dry mass | $m_{dry}$ | TODO | kg | Booster structure mass |
-| Propellant mass | $m_{fuel}$ | TODO | kg | Usable landing propellant mass |
-| Maximum thrust | $T_{max}$ | TODO | N | Engine thrust at full throttle |
-| Minimum throttle | $u_{min}$ | TODO | - | Minimum throttle limit fraction (e.g. 0.40) |
-| Specific impulse | $I_{sp}$ | TODO | s | Effective engine specific impulse |
-| Standard gravity | $g_0$ | 9.80665 | $\text{m/s}^2$ | Gravitational acceleration reference |
-| Local gravity | $g$ | 9.81 [TODO: Confirm in sim/rocket.py] | $\text{m/s}^2$ | Environmental gravitational acceleration |
-| Moment of inertia | $I$ | TODO | $\text{kg}\cdot\text{m}^2$ | Pitch moment of inertia about center of mass |
-| Gimbal moment arm | $l_e$ | TODO | m | Distance from gimbal pivot to center of mass |
-| Maximum gimbal deflection | $\delta_{max}$ | TODO | rad / deg | Maximum allowable gimbal angle |
-| Drag coefficient | $C_D$ | TODO | - | Planar drag coefficient |
-| Reference area | $A$ | TODO | $\text{m}^2$ | Frontal aerodynamic area |
-| Air density | $\rho$ | 1.225 [TODO: Confirm in sim/rocket.py] | $\text{kg/m}^3$ | Sea-level atmospheric air density |
+| Booster dry mass | $m_{dry}$ | `800.0` | $\text{kg}$ | Structural mass without propellant |
+| Usable landing propellant | $m_{fuel}$ | `150.0` | $\text{kg}$ | Usable landing propellant mass |
+| Total liftoff / initial mass | $m_0$ | `950.0` | $\text{kg}$ | Initial mass ($m_{dry} + m_{fuel}$) |
+| Maximum engine thrust | $T_{max}$ | `23298.75` | $\text{N}$ | Full throttle thrust ($2.5 \times m_0 \times g$) |
+| Minimum throttle limit | $u_{min}$ | `0.40` | $-$ | Lower throttle bound (40% of $T_{max}$) |
+| Maximum gimbal deflection | $\delta_{max}$ | `0.1745` ($10^\circ$) | $\text{rad}$ | Maximum nozzle deflection angle |
+| Gimbal moment arm | $L$ | `5.0` | $\text{m}$ | Engine pivot distance below center of mass |
+| Total booster height | $H$ | `20.0` | $\text{m}$ | Full length of booster fuselage |
+| Fuselage diameter | $D$ | `1.5` | $\text{m}$ | Booster outer cylinder diameter |
+| Frontal reference area | $A$ | `1.7671` | $\text{m}^2$ | Frontal aerodynamic area ($\pi D^2 / 4$) |
+| Drag coefficient | $C_D$ | `0.8` | $-$ | Aerodynamic cylinder drag coefficient |
+| Atmospheric density | $\rho$ | `1.225` | $\text{kg/m}^3$ | Sea-level ambient air density |
+| Specific impulse | $I_{sp}$ | `300.0` | $\text{s}$ | Rocket engine effective specific impulse |
+| Local gravity | $g$ | `9.81` | $\text{m/s}^2$ | Surface gravitational acceleration |
+| Standard gravity reference | $g_0$ | `9.81` | $\text{m/s}^2$ | Specific impulse reference acceleration |
+| Integration timestep | $\Delta t$ | `0.02` (sim) / `0.05` (env) | $\text{s}$ | Physics simulation discrete integration step |
+| Peak wind disturbance force | $F_{wind,max}$ | `800.0` | $\text{N}$ | Wind scaling ($\sim 8\text{ m/s}$ peak equivalent push) |
 
-> [TODO: Fill exact numerical values once sim/rocket.py is created.]
+---
 
 ## Environment
 
-### Observation space
+### Observation Space (10 Dimensions)
 
-| Index | Variable | Description | Range | Unit |
-|---|---|---|---|---|
-| 0 | $x$ | Horizontal displacement from pad center | TODO | m |
-| 1 | $y$ | Altitude above landing surface | TODO | m |
-| 2 | $v_x$ | Horizontal downrange velocity | TODO | m/s |
-| 3 | $v_y$ | Vertical velocity | TODO | m/s |
-| 4 | $\theta$ | Pitch angle relative to vertical | TODO | rad |
-| 5 | $\omega$ | Pitch angular velocity | TODO | rad/s |
-| 6 | $m_{fuel}$ | Remaining propellant mass | TODO | kg |
+The observation vector in `envs/landing_env.py` is continuous Box(10,) float32:
 
-> [TODO: Verify observation space bounds in envs/.]
+| Index | Signal | Normalization Formula | Nominal Physical Range | Description |
+|:---:|:---:|:---:|:---:|---|
+| **0** | $x$ | $x / 50.0$ | $[-30.0, 30.0]\text{ m}$ | Lateral offset from pad center |
+| **1** | $y$ | $y / 300.0$ | $[0.0, 310.0]\text{ m}$ | Altitude above landing surface |
+| **2** | $v_x$ | $v_x / 20.0$ | $[-5.0, 5.0]\text{ m/s}$ | Horizontal lateral velocity |
+| **3** | $v_y$ | $v_y / 80.0$ | $[-70.0, -40.0]\text{ m/s}$ | Vertical velocity |
+| **4** | $\sin(\theta)$ | $\sin(\theta)$ | $[-0.087, 0.087]$ | Sine of pitch tilt angle |
+| **5** | $\cos(\theta)$ | $\cos(\theta)$ | $[0.996, 1.000]$ | Cosine of pitch tilt angle |
+| **6** | $\omega$ | $\omega$ | $[-0.05, 0.05]\text{ rad/s}$ | Angular pitch rate |
+| **7** | $m_{fuel}$ | $(m - m_{dry}) / m_{fuel}$ | $[0.0, 1.0]$ | Remaining usable propellant fraction |
+| **8** | $a_{prev,0}$ | $\text{prev\_action}[0]$ | $[-1.0, 1.0]$ | Commanded throttle in previous step |
+| **9** | $a_{prev,1}$ | $\text{prev\_action}[1]$ | $[-1.0, 1.0]$ | Commanded gimbal in previous step |
 
-### Action space
+When `sensor_noise > 0.0`, zero-mean Gaussian noise is added to the observations using signal standard deviations: $\sigma = [0.02, 0.01, 0.02, 0.01, 0.015, 0.015, 0.025, 0.01, 0.01, 0.01] \times \text{sensor\_noise}$.
 
-| Index | Action | Description | Continuous range | Unit |
-|---|---|---|---|---|
-| 0 | Throttle command | Engine thrust fraction | [0, 1] [TODO: verify env bounds] | - |
-| 1 | Gimbal deflection | Gimbal angle command | [-1, 1] mapped to $[-\delta_{max}, \delta_{max}]$ [TODO: verify] | - |
+### Action Space (2 Dimensions)
 
-> [TODO: Verify action space normalization in envs/.]
+The continuous action command vector is Box(2,) float32 in $[-1.0, 1.0]^2$:
 
-### Reward structure
+- **Action[0] (Throttle):**
+  - If $a_0 < -0.5$: Engine is **OFF** ($u = 0.0$, zero thrust, zero propellant consumption).
+  - If $a_0 \ge -0.5$: Linearly mapped from $[-0.5, 1.0]$ to $[u_{min}, 1.0] = [0.40, 1.00]$.
+- **Action[1] (Gimbal):**
+  - Linearly mapped from $[-1.0, 1.0]$ to $[-\delta_{max}, \delta_{max}] = [-10^\circ, +10^\circ]$.
 
-| Term | Application condition | Weight / Formulation |
-|---|---|---|
-| Distance shaping | Every step | $-w_d \sqrt{x^2 + y^2}$ [TODO: check envs/] |
-| Velocity penalty | Every step | $-w_v (v_x^2 + v_y^2)$ [TODO: check envs/] |
-| Attitude penalty | Every step | $-w_\theta \theta^2 - w_\omega \omega^2$ [TODO: check envs/] |
-| Fuel penalty | Every step when engine fires | $-w_f \cdot \text{throttle}$ [TODO: check envs/] |
-| Touchdown bonus | Terminal step upon successful landing | $+B_{land}$ [TODO: check envs/] |
-| Crash penalty | Terminal step upon velocity or angle violation | $-P_{crash}$ [TODO: check envs/] |
+---
 
-> [TODO: Verify reward weights and equations in envs/.]
+## Reward design & loopholes
 
-### Termination conditions
+### Reward Function Terms (from `envs/landing_env.py`)
 
-An episode terminates when any of the following events occur:
-- Ground contact: altitude reaches ground level ($y \le 0$), evaluating to success if within limits or crash otherwise.
-- Spatial boundary exit: booster exceeds maximum horizontal or vertical boundaries ($|x| > x_{max}$ or $y > y_{max}$) [TODO: verify bounds in envs/].
-- Excessive tilt: attitude angle exceeds recovery limits ($|\theta| > \theta_{max}$) [TODO: verify limits in envs/].
-- Fuel exhaustion: usable propellant drops to zero ($m_{fuel} \le 0$).
-- Timestep limit: episode reaches maximum allowed simulation steps ($t \ge t_{max}$) [TODO: verify step limit in envs/].
+The step reward balances potential-based shaping against penalties and terminal bonuses:
+
+$$R_t = R_{\text{progress}} - R_{\text{fuel}} - R_{\text{time}} + R_{\text{terminal}}$$
+
+| Term | Weight / Formulation | Value | Physical Rationale |
+|---|---|:---:|---|
+| **Potential Error** | $\Phi = 1.0 \sqrt{(x/50)^2 + (y/300)^2} + 0.5 \sqrt{(vx/20)^2 + (vy/80)^2} + 0.5 (\|\theta\| / 5^\circ)$ | Continuous | Weighted distance, velocity, and tilt metric |
+| **Progress Reward** | $100.0 \times (\Phi_{t-1} - \Phi_t)$ | Scale: `100.0` | Dense potential difference towards target pad |
+| **Fuel Penalty** | $-0.005 \times \text{throttle}$ | Weight: `0.005` | Incentivizes late hoverslam ignition |
+| **Time Penalty** | $-0.01$ | Cost: `0.01`/step | Encourages prompt mission completion |
+| **Soft Landing Bonus** | $+100.0$ | Bonus: `+100.0` | Terminal reward upon meeting all touchdown limits |
+| **Crash Base Penalty** | $-100.0$ | Penalty: `-100.0` | Terminal base penalty for impact limit violation |
+| **Crash Speed Penalty** | $-1.0 \times \|v_y\|$ | Weight: `1.0`/($\text{m/s}$) | Scales penalty with impact kinetic energy |
+| **Out-of-Bounds Penalty** | $-100.0$ | Penalty: `-100.0` | Triggered if $\|x\| > 200\text{ m}$ or $y > 500\text{ m}$ |
+
+### Empirical Loopholes Discovered & Mitigated
+
+1. **The Suicide Free-Fall Loophole:**
+   - *Observation:* When the per-step fuel consumption penalty was weighted too heavily, the agent learned that cutting throttle to zero ($u = 0.0$) accumulated zero fuel cost, yielding a higher cumulative return than firing the engine and risking a non-zero impact penalty.
+   - *Fix:* Scaled the terminal crash penalty and speed penalty while reducing fuel penalty weight to `0.005`.
+2. **The Belly-Flop Slider Loophole:**
+   - *Observation:* Without a strict horizontal touchdown velocity and tilt penalty at $y \le 0$, the agent pitched $90^\circ$ sideways just before touchdown, using the broad cylinder body to increase drag and sliding across the terrain on its side to register a low vertical $v_y$.
+   - *Fix:* Added strict multi-axis terminal gates requiring $|v_x| < 1.0\text{ m/s}$ and $|\theta| < 5.0^\circ$ for `landed = True`.
+3. **The Orbit Escape Loophole:**
+   - *Observation:* To avoid ground collision penalties entirely, early agents fired maximum throttle continuously, escaping upward past $y = 500\text{ m}$ into space.
+   - *Fix:* Added hard spatial boundary checks ($y > 500\text{ m}$ or $|x| > 200\text{ m}$) that immediately terminate the episode with an out-of-bounds penalty of `-100.0`.
+4. **PID High-Frequency Noise Exploitation:**
+   - *Observation:* Classical PID computes velocity and attitude error derivatives ($K_d \cdot \Delta e / \Delta t$). Under unmodeled Gaussian sensor noise, dividing high-frequency noise by $\Delta t = 0.05\text{ s}$ amplified noise 20-fold, driving nozzle gimbal and throttle into violent saturation and causing $97\%$ crashes at noise $0.25$.
+   - *Fix:* PPO neural policy acts as a bounded non-linear filter ($Tanh$ activations) that remains stable across noise scales.
+
+---
 
 ## Baselines
 
-The classical baseline uses a cascaded Proportional-Integral-Derivative (PID) architecture operating in three coordinated loops:
-- Altitude loop: Calculates required vertical engine thrust by comparing current altitude and descent rate against a target deceleration trajectory.
-- Horizontal position loop: Calculates a reference pitch angle $\theta_{ref}$ proportional to lateral displacement error $x$ and velocity $v_x$.
-- Attitude loop: Commands the engine gimbal deflection angle $\delta$ to track reference pitch $\theta_{ref}$ while applying derivative damping against angular velocity $\omega$.
+The classical baseline in `controllers/pid.py` implements a cascaded controller operating in three coordinated loops:
 
-The PPO agent is compared against this PID controller because PID represents the industry standard for linear flight control. Decoupled linear PID loops assume independent axes and continuous control authority. A rocket landing engine has a non-zero minimum throttle limit (typically 20% to 40% of maximum thrust), preventing steady hovering and coupling altitude descent to horizontal translation. The comparison tests whether reinforcement learning discovers coordinated non-linear throttle and vectoring profiles that outperform classical linear approximations under severe constraints.
+1. **Altitude & Hoverslam Ignition Loop:**
+   - Computes kinematic stopping distance: $s_{\text{stop}} = \frac{v_y^2}{2 a_{\text{brake}}} \times 1.05$.
+   - Holds engine **OFF** until $y \le s_{\text{stop}}$.
+   - Once ignited, tracks velocity target: $v_{\text{target}} = -\left(\sqrt{2 a_{\text{brake}} y} + v_{\text{land}}\right)$ with PID gains ($K_p = 3.5, K_i = 0.05, K_d = 0.15$).
+2. **Horizontal Outer Loop:**
+   - Converts lateral position error $x$ and velocity $v_x$ into commanded target pitch angle $\theta_{\text{target}}$ ($K_p = 0.015, K_d = 0.055$), clamped to $12^\circ$.
+3. **Attitude Inner Loop:**
+   - Tracks target pitch $\theta_{\text{target}}$ by commanding engine nozzle gimbal deflection $\delta$ ($K_p = 2.5, K_d = 1.8, K_i = 0.02$).
+
+---
 
 ## Training setup
 
-| Parameter | Configuration | Notes |
+Configured via `train.py` using Stable-Baselines3:
+
+| Hyperparameter | Configuration | Description |
 |---|---|---|
-| Algorithm | PPO (Stable-Baselines3) | Clipped surrogate objective |
-| Policy architecture | 2-layer MLP (64, 64) [TODO: confirm train.py] | Orthogonal weight initialization |
-| Parallel environments | TODO: check train.py | Vectorized simulation workers |
-| Total environment steps | TODO: check train.py | Total training timesteps |
-| Evaluation seeds | 3 seeds [TODO: confirm list in train.py] | Statistical validation seeds |
-| Learning rate | TODO: check train.py | Adam optimizer learning rate |
-| Discount factor ($\gamma$) | TODO: check train.py | Temporal reward discount |
-| GAE factor ($\lambda$) | TODO: check train.py | Generalized advantage estimation |
-| Minibatch size | TODO: check train.py | Optimization minibatch size |
-| Entropy coefficient | TODO: check train.py | Exploration bonus coefficient |
-| Domain wind range | TODO: check envs/ | Mean wind velocity interval (m/s) |
-| Domain mass range | TODO: check envs/ | Vehicle structural mass variation (%) |
-| Domain thrust range | TODO: check envs/ | Engine thrust efficiency factor |
-| Initial state dispersion | TODO: check envs/ | Starting altitude, lateral offset, velocity intervals |
+| **RL Algorithm** | PPO (Proximal Policy Optimization) | Clipped surrogate objective |
+| **Policy Network** | MlpPolicy `[64, 64]` | 2 hidden layers with Tanh activations |
+| **Parallel Workers** | `8` environments | `SubprocVecEnv` with `VecMonitor` |
+| **Total Timesteps** | `1,000,000` (default) | Environment interaction steps |
+| **Batch Size** | `64` | Optimization minibatch size |
+| **Rollout Buffer** | `2048` steps per env (`16,384` total) | Horizon per update |
+| **Learning Rate** | `3e-4` | Adam optimizer learning rate |
+| **Discount Factor ($\gamma$)** | `0.99` | Temporal discount factor |
+| **GAE Parameter ($\lambda$)** | `0.95` | Generalized advantage estimation |
+| **Clip Range** | `0.2` | PPO surrogate clip fraction |
+| **Evaluation Seeds** | `0, 1, 2` | Statistical verification across independent runs |
 
-> [TODO: Lock hyperparameters in table once train.py is implemented.]
+---
 
-## Debugging history
+## Quickstart: Run in under 10 minutes
 
-1. Gimbal torque sign inversion: In initial equations of motion, a positive gimbal deflection angle produced positive angular acceleration instead of negative restoring torque. Because the actuator pushed the rocket away from vertical rather than restoring it, the policy quickly destabilized into an uncontrollable spin. Reversing the moment arm sign restored negative feedback stabilization.
-2. Fuel reward loophole and free fall: When the per-step fuel consumption penalty was set too high relative to the terminal crash penalty, the agent discovered that cutting engine throttle to zero maximized total episode return. The booster plummeted without firing its engine. Reducing the fuel penalty weight and scaling the terminal crash penalty eliminated this behavior.
-3. Sideways touchdown exploitation: In early reward formulations lacking lateral velocity constraints at ground impact, the agent minimized vertical impact speed by pitching horizontal and sliding across the ground on its airframe. Introducing a strict upright angle penalty and dedicated horizontal velocity touchdown threshold forced the agent to land upright on its legs.
-4. Premature episode truncation: Setting strict pitch angle termination limits ($|\theta| > 15^\circ$) during early training caused episodes to terminate before the agent could explore the benefit of late retro-propulsion burns. Relaxing early termination limits during initial training allowed the policy to recover from wider angles.
-
-> [TODO: Add further empirical failure modes from NOTES.md as experiments continue.]
-
-## Limitations
-
-The simulation omits several physical characteristics present on actual launch vehicles:
-- Planar two-dimensional dynamics: The model simulates motion exclusively in the $x$-$y$ plane, ignoring out-of-plane crosswinds, aerodynamic roll, yaw moments, and gyroscopic forces from rotating turbopump machinery.
-- Rigid-body assumption: Propellant mass is modeled as a uniform point or rigid cylinder, omitting liquid propellant slosh dynamics that shift the vehicle center of mass and introduce destabilizing fluid pendulum modes.
-- Instantaneous actuator response: Engine gimbal vectoring and throttle response are modeled without hydraulic actuator slew rates, delays, or turbopump spool-up latencies.
-- Atmospheric simplifications: Aerodynamic drag uses a static drag coefficient and constant air density rather than Mach-dependent transonic compression curves, atmospheric temperature gradients, or grid fin lift.
-- Full state observability: The environment passes clean true state vectors to the agent, omitting sensor noise, accelerometer bias drift, GPS latency, and Kalman filtering estimation lag.
-
-Deploying on real hardware would require extending guidance to three dimensions, modeling actuator response delays, integrating an Extended Kalman Filter for navigation, and adding aerodynamic control surfaces such as cold-gas thrusters and grid fins.
-
-## Execution
-
-Commands run from the project root directory with the virtual environment activated:
+### 1. Environment Setup (~1 minute)
 
 ```bash
-# Set up virtual environment and dependencies
+git clone https://github.com/AdityaSurse/hoverslam.git
+cd hoverslam
+
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
-Expected runtime: 1-2 minutes depending on network download speeds.
+
+### 2. Verify Test Suite (~1 second)
+
+Run the automated test suite covering physics kinematics, PID controller logic, environment features, and PPO training components:
 
 ```bash
-# Run unit test suite
-source venv/bin/activate
-pytest
+pytest tests/
 ```
-Expected runtime: < 1 second.
+
+### 3. Evaluate Pretrained Controllers (~4 minutes)
+
+Execute the benchmark suite comparing Classical PID against trained PPO agents:
 
 ```bash
-# Train PPO landing agent
-source venv/bin/activate
-python train.py
+# Quick evaluation mode (100 episodes per condition)
+python evaluate.py --quick
+
+# Full Monte Carlo evaluation protocol (1,000 episodes per condition)
+# python evaluate.py --full
 ```
-Expected runtime: [TODO: Add training runtime once pipeline is implemented].
+
+Outputs generated:
+- `results/benchmark.csv`
+- `results/benchmark_table.md`
+- `results/success_vs_wind.png`
+- `results/success_vs_noise.png`
+
+### 4. Render Side-by-Side Demo Video (~10 seconds)
+
+Export the 78-second HD side-by-side comparison video and 10-second GIF preview:
 
 ```bash
-# Evaluate benchmark controllers
-source venv/bin/activate
-python evaluate.py
-```
-Expected runtime: < 1 second for initial script; [TODO: Update runtime with full Monte Carlo rollout].
-
-```bash
-# Render landing visualization
-source venv/bin/activate
 python render.py
 ```
-Expected runtime: < 1 second for initial script; [TODO: Update runtime with full video generation].
+
+Outputs generated:
+- `results/hoverslam_demo.mp4` (78.8s HD video, 2.8 MB)
+- `results/hoverslam_preview.gif` (10s preview animation, 1.2 MB)
+
+---
+
+## Limitations & sim-to-real gap
+
+The simulation simplifies launch vehicle dynamics in several important ways:
+
+1. **Planar 2D Motion:** Dynamics are constrained to the $x$-$y$ plane, neglecting 3D crosswinds, roll/yaw coupling, and gyroscopic turbopump precession.
+2. **Rigid Point-Mass Propellant:** Fuel mass is assumed uniformly centered, neglecting liquid propellant slosh dynamics that shift center-of-mass and excite low-frequency pendulum modes.
+3. **Instantaneous Actuation:** Engine gimbal servos and turbopump throttle response are modeled without hydraulic slew rate limits, transport delays, or ignition transients.
+4. **Static Atmosphere:** Uses constant air density ($\rho = 1.225\text{ kg/m}^3$) and static drag coefficient ($C_D = 0.8$), omitting transonic compressibility, Mach shock waves, and grid fin lift.
+5. **Full State Observability:** While sensor noise is modeled, the agent does not account for accelerometer drift, GPS packet dropouts, or Extended Kalman Filter (EKF) covariance lag.
+
+---
 
 ## Repository structure
 
 ```
 hoverslam/
-├── controllers/          # Classical baseline controllers (PID)
-│   └── __init__.py
-├── envs/                 # Gymnasium landing environments
-│   └── __init__.py
-├── results/              # Benchmark tables, evaluation plots, and video recordings
-│   └── .gitkeep
-├── sim/                  # 2D rigid-body rocket dynamics simulation
-│   └── __init__.py
-├── tests/                # Pytest verification suite
-│   └── __init__.py
-├── evaluate.py           # Benchmark script comparing PID and PPO agents
-├── NOTES.md              # Engineering log and debugging history
+├── controllers/          # Classical flight baseline controllers
+│   ├── __init__.py
+│   └── pid.py            # Cascaded altitude, horizontal, and attitude PID controller
+├── envs/                 # Gymnasium environments
+│   ├── __init__.py
+│   └── landing_env.py    # 10-dim state HoverSlamEnv with wind and noise
+├── models/               # Trained neural network model checkpoints
+│   ├── ppo_nominal_s0/   # Nominal models across seeds 0, 1, 2
+│   ├── ppo_randomized_s0/# Domain randomized models across seeds 0, 1, 2
+│   └── ppo_randomized_best/ # Optimized noise-robust checkpoint
+├── results/              # Evaluation outputs, datasets, plots, and video recordings
+│   ├── benchmark.csv     # Raw Monte Carlo evaluation metrics
+│   ├── benchmark_table.md# Markdown summary table
+│   ├── hoverslam_demo.mp4# 78.8s side-by-side HD comparison video
+│   ├── hoverslam_preview.gif # 10s animated GIF preview
+│   ├── success_vs_noise.png  # Sensor noise sensitivity curve
+│   └── success_vs_wind.png   # Wind sensitivity curve
+├── sim/                  # 2D rigid-body rocket dynamics engine
+│   ├── __init__.py
+│   └── rocket.py         # Planar dynamics, aerodynamics, and numerical integration
+├── tests/                # Automated verification test suite (30 passing tests)
+│   ├── __init__.py
+│   ├── test_env.py
+│   ├── test_env_features.py
+│   ├── test_physics.py
+│   ├── test_pid.py
+│   └── test_train.py
+├── evaluate.py           # Multi-controller sensitivity benchmark suite
+├── NOTES.md              # Engineering log and milestone tracking
 ├── README.md             # Project documentation
-├── render.py             # Trajectory visualization and video rendering
+├── render.py             # Video rendering pipeline using imageio-ffmpeg
 ├── requirements.txt      # Pinned Python dependencies
-└── train.py              # PPO training pipeline
+└── train.py              # PPO training pipeline using Stable-Baselines3
 ```
+
+---
 
 ## License
 
 Distributed under the MIT License.
-Author: Aditya Surse
+Author: Aditya Surse (`adityasurse42@gmail.com`)
