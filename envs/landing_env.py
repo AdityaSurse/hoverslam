@@ -43,6 +43,54 @@ DEFAULT_REWARD_WEIGHTS: dict[str, float] = {
     "out_of_bounds_penalty": 100.0, # Terminal penalty for exiting operational boundary
 }
 
+# -----------------------------------------------------------------------------
+# Disturbance & Domain Randomization Constants
+# -----------------------------------------------------------------------------
+# Peak wind aerodynamic force in Newtons (1.0 = ~8 m/s equivalent push at peak)
+MAX_WIND_FORCE: float = 800.0
+
+# Base standard deviations for each of the 10 observation signals
+DEFAULT_SENSOR_SIGMAS: np.ndarray = np.array([
+    0.020,  # x: ~1.0m / 50m
+    0.010,  # y: ~3.0m / 300m
+    0.020,  # vx: ~0.4 m/s / 20 m/s
+    0.010,  # vy: ~0.8 m/s / 80 m/s
+    0.015,  # sin(theta): ~0.8 deg
+    0.015,  # cos(theta): ~0.8 deg
+    0.025,  # omega: ~0.025 rad/s
+    0.010,  # fuel_fraction: ~1%
+    0.010,  # prev_action[0]: ~1%
+    0.010,  # prev_action[1]: ~1%
+], dtype=np.float32)
+
+# Start state dispersions for nominal, wide, and curriculum-easy configurations
+DEFAULT_START_RANGES: dict[str, Any] = {
+    "x_range": (-30.0, 30.0),
+    "y_range": (290.0, 310.0),
+    "vx_range": (-5.0, 5.0),
+    "vy_range": (-70.0, -40.0),
+    "theta_max_deg": 5.0,
+    "omega_range": (-0.05, 0.05),
+}
+
+WIDE_START_RANGES: dict[str, Any] = {
+    "x_range": (-60.0, 60.0),
+    "y_range": (250.0, 350.0),
+    "vx_range": (-10.0, 10.0),
+    "vy_range": (-80.0, -30.0),
+    "theta_max_deg": 10.0,
+    "omega_range": (-0.10, 0.10),
+}
+
+EASY_START_RANGES: dict[str, Any] = {
+    "x_range": (-10.0, 10.0),
+    "y_range": (100.0, 150.0),
+    "vx_range": (-1.0, 1.0),
+    "vy_range": (-20.0, -10.0),
+    "theta_max_deg": 1.0,
+    "omega_range": (-0.01, 0.01),
+}
+
 
 class HoverSlamEnv(gym.Env):
     """2D Rocket Booster Landing Environment.
@@ -81,6 +129,10 @@ class HoverSlamEnv(gym.Env):
         sensor_noise: float = 0.0,
         mass_randomization: float = 0.0,
         randomize_start: bool = False,
+        wide_start: bool = False,
+        curriculum: bool = False,
+        curriculum_level: float = 0.0,
+        sample_random_params_each_episode: bool = False,
         render_mode: str | None = None,
         reward_weights: dict[str, float] | None = None,
     ) -> None:
@@ -91,7 +143,23 @@ class HoverSlamEnv(gym.Env):
         self.sensor_noise = float(sensor_noise)
         self.mass_randomization = float(mass_randomization)
         self.randomize_start = bool(randomize_start)
+        self.wide_start = bool(wide_start)
+        self.curriculum = bool(curriculum)
+        self.curriculum_level = float(curriculum_level) if curriculum else 1.0
+        self.sample_random_params_each_episode = bool(sample_random_params_each_episode)
         self.render_mode = render_mode
+
+        # Base configuration parameters
+        self._base_wind_strength = self.wind_strength
+        self._base_sensor_noise = self.sensor_noise
+        self._base_mass_randomization = self.mass_randomization
+
+        # Wind dynamics state (Ornstein-Uhlenbeck process)
+        self.steady_wind: float = 0.0
+        self.gust: float = 0.0
+        self.ou_theta: float = 1.0  # Mean reversion rate
+        self.ou_sigma: float = 0.5  # Volatility parameter
+        self.last_wind_x: float = 0.0
 
         # Configure reward weights
         self.reward_weights = DEFAULT_REWARD_WEIGHTS.copy()
@@ -128,6 +196,11 @@ class HoverSlamEnv(gym.Env):
         # Matplotlib rendering cache
         self.fig = None
         self.ax = None
+
+    def set_curriculum_level(self, level: float) -> None:
+        """Update curriculum difficulty level in [0.0, 1.0]."""
+        self.curriculum = True
+        self.curriculum_level = float(np.clip(level, 0.0, 1.0))
 
     def _map_action(self, action: np.ndarray | list[float]) -> tuple[float, float]:
         """Convert normalized action [-1, 1]^2 to physical throttle and gimbal angle.
@@ -203,7 +276,8 @@ class HoverSlamEnv(gym.Env):
         ], dtype=np.float32)
 
         if self.sensor_noise > 0.0:
-            noise = self.np_random.normal(0.0, self.sensor_noise, size=obs.shape).astype(np.float32)
+            sigmas = self.sensor_noise * DEFAULT_SENSOR_SIGMAS
+            noise = self.np_random.normal(0.0, sigmas, size=obs.shape).astype(np.float32)
             obs = obs + noise
 
         return obs
@@ -216,20 +290,77 @@ class HoverSlamEnv(gym.Env):
         """Reset environment to initial state."""
         super().reset(seed=seed)
 
-        # Handle mass randomization if requested
+        # 1. Parameter sampling for episode-level domain randomization
+        if self.sample_random_params_each_episode:
+            self.wind_strength = float(self.np_random.uniform(0.0, 1.0))
+            self.sensor_noise = float(self.np_random.uniform(0.0, 1.0))
+            self.mass_randomization = 0.10
+            self.randomize_start = True
+            self.wide_start = True
+
+            # If curriculum is active, scale difficulty by curriculum_level
+            if self.curriculum:
+                self.wind_strength *= self.curriculum_level
+                self.sensor_noise *= self.curriculum_level
+                self.mass_randomization *= self.curriculum_level
+
+        # 2. Wind dynamics initialization (steady component + zero initial gust)
+        if self.wind_strength > 0.0:
+            self.steady_wind = float(self.np_random.uniform(-0.6, 0.6))
+        else:
+            self.steady_wind = 0.0
+        self.gust = 0.0
+        self.last_wind_x = 0.0
+
+        # 3. Mass randomization (±10% on start mass when mass_randomization = 0.10)
         if self.mass_randomization > 0.0:
-            mass_mult = float(self.np_random.uniform(
-                1.0 - self.mass_randomization,
-                1.0 + self.mass_randomization,
-            ))
-            fuel_mass = FUEL_MASS * mass_mult
+            delta = float(self.np_random.uniform(-self.mass_randomization, self.mass_randomization))
+            total_start_mass = START_MASS * (1.0 + delta)
+            fuel_mass = max(10.0, total_start_mass - DRY_MASS)
         else:
             fuel_mass = FUEL_MASS
 
-        # Initialize physical state
-        if self.randomize_start:
+        # 4. Physical state initialization
+        if self.curriculum:
+            c = float(np.clip(self.curriculum_level, 0.0, 1.0))
+            x_min = (1.0 - c) * EASY_START_RANGES["x_range"][0] + c * WIDE_START_RANGES["x_range"][0]
+            x_max = (1.0 - c) * EASY_START_RANGES["x_range"][1] + c * WIDE_START_RANGES["x_range"][1]
+            y_min = (1.0 - c) * EASY_START_RANGES["y_range"][0] + c * WIDE_START_RANGES["y_range"][0]
+            y_max = (1.0 - c) * EASY_START_RANGES["y_range"][1] + c * WIDE_START_RANGES["y_range"][1]
+            vx_min = (1.0 - c) * EASY_START_RANGES["vx_range"][0] + c * WIDE_START_RANGES["vx_range"][0]
+            vx_max = (1.0 - c) * EASY_START_RANGES["vx_range"][1] + c * WIDE_START_RANGES["vx_range"][1]
+            vy_min = (1.0 - c) * EASY_START_RANGES["vy_range"][0] + c * WIDE_START_RANGES["vy_range"][0]
+            vy_max = (1.0 - c) * EASY_START_RANGES["vy_range"][1] + c * WIDE_START_RANGES["vy_range"][1]
+            theta_max = (1.0 - c) * EASY_START_RANGES["theta_max_deg"] + c * WIDE_START_RANGES["theta_max_deg"]
+            om_min = (1.0 - c) * EASY_START_RANGES["omega_range"][0] + c * WIDE_START_RANGES["omega_range"][0]
+            om_max = (1.0 - c) * EASY_START_RANGES["omega_range"][1] + c * WIDE_START_RANGES["omega_range"][1]
+
             sim_seed = int(self.np_random.integers(0, 2**31 - 1))
-            self.state = sim_reset(seed=sim_seed, randomize=True, fuel_mass=fuel_mass)
+            self.state = sim_reset(
+                seed=sim_seed,
+                randomize=True,
+                x_range=(x_min, x_max),
+                y_range=(y_min, y_max),
+                vx_range=(vx_min, vx_max),
+                vy_range=(vy_min, vy_max),
+                theta_max_deg=theta_max,
+                omega_range=(om_min, om_max),
+                fuel_mass=fuel_mass,
+            )
+        elif self.randomize_start:
+            ranges = WIDE_START_RANGES if self.wide_start else DEFAULT_START_RANGES
+            sim_seed = int(self.np_random.integers(0, 2**31 - 1))
+            self.state = sim_reset(
+                seed=sim_seed,
+                randomize=True,
+                x_range=ranges["x_range"],
+                y_range=ranges["y_range"],
+                vx_range=ranges["vx_range"],
+                vy_range=ranges["vy_range"],
+                theta_max_deg=ranges["theta_max_deg"],
+                omega_range=ranges["omega_range"],
+                fuel_mass=fuel_mass,
+            )
         else:
             self.state = sim_reset(randomize=False, fuel_mass=fuel_mass)
 
@@ -255,6 +386,8 @@ class HoverSlamEnv(gym.Env):
             "distance_from_pad": float(np.hypot(self.state[IDX_X], self.state[IDX_Y])),
             "fuel_remaining": float(max(0.0, self.state[IDX_M] - DRY_MASS)),
             "step_count": 0,
+            "wind_x": 0.0,
+            "curriculum_level": self.curriculum_level,
         }
 
         return obs, info
@@ -275,11 +408,20 @@ class HoverSlamEnv(gym.Env):
         self.last_throttle = throttle
         self.last_gimbal = gimbal
 
-        # Calculate wind disturbance if enabled
+        # Calculate wind disturbance if enabled (steady wind + Ornstein-Uhlenbeck gust)
         if self.wind_strength > 0.0:
-            wind_x = float(self.np_random.uniform(-self.wind_strength, self.wind_strength))
+            dw = float(self.np_random.normal(0.0, 1.0))
+            self.gust += -self.ou_theta * self.gust * self.dt + self.ou_sigma * np.sqrt(self.dt) * dw
+            raw_wind = float(np.clip(self.steady_wind + self.gust, -1.0, 1.0))
+
+            if self.wind_strength <= 1.0:
+                wind_x = raw_wind * MAX_WIND_FORCE * self.wind_strength
+            else:
+                wind_x = raw_wind * self.wind_strength
         else:
             wind_x = 0.0
+
+        self.last_wind_x = wind_x
 
         # Step physics simulator
         self.state = sim_step(
@@ -352,6 +494,8 @@ class HoverSlamEnv(gym.Env):
             "distance_from_pad": float(np.hypot(self.state[IDX_X], max(0.0, self.state[IDX_Y]))),
             "fuel_remaining": float(max(0.0, self.state[IDX_M] - DRY_MASS)),
             "step_count": self.step_count,
+            "wind_x": wind_x,
+            "curriculum_level": self.curriculum_level,
         }
 
         return obs, reward, terminated, truncated, info

@@ -135,6 +135,58 @@ class LandingStatsCallback(BaseCallback):
             self.logger.record("rollout/mean_touchdown_speed", mean_speed)
 
 
+class CurriculumCallback(BaseCallback):
+    """Monitors rolling landing success rate and advances curriculum difficulty level.
+
+    Begins at curriculum_level = 0.0 (easy starts, no wind/noise).
+    Whenever the rolling success rate exceeds 80% (over at least min_episodes),
+    the difficulty level is incremented until reaching 1.0 (full difficulty).
+    """
+
+    def __init__(
+        self,
+        landing_cb: LandingStatsCallback,
+        threshold: float = 0.80,
+        min_episodes: int = 20,
+        step_increment: float = 0.25,
+        verbose: int = 1,
+    ) -> None:
+        super().__init__(verbose)
+        self.landing_cb = landing_cb
+        self.threshold = threshold
+        self.min_episodes = min_episodes
+        self.step_increment = step_increment
+        self.current_level: float = 0.0
+        self.episodes_at_current_level: int = 0
+        self.last_total_episodes: int = 0
+
+    def _on_step(self) -> bool:
+        new_episodes = self.landing_cb.total_episodes - self.last_total_episodes
+        self.episodes_at_current_level += new_episodes
+        self.last_total_episodes = self.landing_cb.total_episodes
+
+        if (
+            len(self.landing_cb.landed_history) >= self.min_episodes
+            and self.episodes_at_current_level >= self.min_episodes
+        ):
+            recent_success = float(np.mean(self.landing_cb.landed_history))
+            if recent_success >= self.threshold and self.current_level < 1.0:
+                self.current_level = float(np.clip(self.current_level + self.step_increment, 0.0, 1.0))
+                self.episodes_at_current_level = 0
+                self.training_env.env_method("set_curriculum_level", self.current_level)
+                if self.verbose > 0:
+                    print(
+                        f"\n>>> [Curriculum] Rolling success rate {recent_success * 100:.1f}% >= {self.threshold * 100:.0f}%. "
+                        f"Advancing curriculum difficulty to level {self.current_level:.2f}!\n"
+                    )
+
+        self.logger.record("curriculum/level", self.current_level)
+        return True
+
+    def _on_rollout_end(self) -> None:
+        self.logger.record("curriculum/level", self.current_level)
+
+
 def make_env(
     rank: int,
     seed: int,
@@ -143,6 +195,10 @@ def make_env(
     sensor_noise: float = 0.0,
     mass_randomization: float = 0.0,
     randomize_start: bool = False,
+    wide_start: bool = False,
+    curriculum: bool = False,
+    curriculum_level: float = 0.0,
+    sample_random_params_each_episode: bool = False,
 ) -> Callable[[], gym.Env]:
     """Create an isolated, seeded factory for HoverSlamEnv."""
 
@@ -153,6 +209,10 @@ def make_env(
             sensor_noise=sensor_noise,
             mass_randomization=mass_randomization,
             randomize_start=randomize_start,
+            wide_start=wide_start,
+            curriculum=curriculum,
+            curriculum_level=curriculum_level,
+            sample_random_params_each_episode=sample_random_params_each_episode,
         )
         env.reset(seed=seed + rank)
         env.action_space.seed(seed + rank)
@@ -194,17 +254,22 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--wind",
         action=FlagOrValueAction,
-        help="Enable wind disturbance (flag sets 500.0 N, or specify float).",
+        help="Enable wind disturbance (flag sets 1.0, or specify float in [0, 1]).",
     )
     parser.add_argument(
         "--noise",
         action=FlagOrValueAction,
-        help="Enable sensor observation noise (flag sets 0.02 std, or specify float).",
+        help="Enable sensor observation noise (flag sets 1.0, or specify float in [0, 1]).",
     )
     parser.add_argument(
         "--randomize",
         action=FlagOrValueAction,
-        help="Enable domain randomization (randomized initial state and vehicle mass).",
+        help="Enable domain randomization: samples wind, noise in [0,1], mass ±10%, wide start.",
+    )
+    parser.add_argument(
+        "--curriculum",
+        action="store_true",
+        help="Enable curriculum learning (auto-widens difficulty when rolling success rate exceeds 80%).",
     )
     parser.add_argument(
         "--run-name",
@@ -222,22 +287,31 @@ def train(args: argparse.Namespace) -> tuple[PPO, dict[str, Any]]:
     set_random_seed(args.seed)
 
     # Resolve physical disturbance & randomization parameters
+    sample_each_episode = bool(args.randomize)
+    is_curriculum = bool(args.curriculum)
+
     if isinstance(args.wind, bool):
-        wind_strength = 500.0 if args.wind else 0.0
+        wind_strength = 1.0 if args.wind else 0.0
     else:
         wind_strength = float(args.wind)
 
     if isinstance(args.noise, bool):
-        sensor_noise = 0.02 if args.noise else 0.0
+        sensor_noise = 1.0 if args.noise else 0.0
     else:
         sensor_noise = float(args.noise)
 
-    if isinstance(args.randomize, bool):
-        randomize_start = args.randomize
-        mass_randomization = 0.10 if args.randomize else 0.0
-    else:
+    if sample_each_episode:
         randomize_start = True
+        wide_start = True
+        mass_randomization = 0.10
+    elif isinstance(args.randomize, (int, float)) and args.randomize > 0.0:
+        randomize_start = True
+        wide_start = True
         mass_randomization = float(args.randomize)
+    else:
+        randomize_start = False
+        wide_start = False
+        mass_randomization = 0.0
 
     # Determine unique run identifier
     if args.run_name:
@@ -245,12 +319,14 @@ def train(args: argparse.Namespace) -> tuple[PPO, dict[str, Any]]:
     else:
         mode_str = "vert" if args.vertical_only else "planar"
         cond_parts = []
-        if wind_strength > 0.0:
+        if is_curriculum:
+            cond_parts.append("curr")
+        if sample_each_episode:
+            cond_parts.append("rand")
+        elif wind_strength > 0.0:
             cond_parts.append("wind")
-        if sensor_noise > 0.0:
+        if sensor_noise > 0.0 and not sample_each_episode:
             cond_parts.append("noise")
-        if randomize_start or mass_randomization > 0.0:
-            cond_parts.append("dr")
         cond_str = f"_{'_'.join(cond_parts)}" if cond_parts else "_nominal"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"ppo_{mode_str}{cond_str}_s{args.seed}_{timestamp}"
@@ -269,9 +345,11 @@ def train(args: argparse.Namespace) -> tuple[PPO, dict[str, Any]]:
     print(f"Total Timesteps:           {args.total_steps:,}")
     print(f"Parallel Environments:     {args.n_envs}")
     print(f"Vertical Only Mode:        {'Enabled' if args.vertical_only else 'Disabled (Full 2D)'}")
-    print(f"Wind Disturbance:          {wind_strength:.1f} N ({'Enabled' if wind_strength > 0 else 'Disabled'})")
-    print(f"Sensor Noise:              {sensor_noise:.4f} ({'Enabled' if sensor_noise > 0 else 'Disabled'})")
-    print(f"Domain Randomization:      {'Enabled' if randomize_start else 'Disabled'} (mass_rand={mass_randomization:.2f})")
+    print(f"Domain Randomization:      {'Enabled (sampled per episode)' if sample_each_episode else 'Disabled'}")
+    print(f"Curriculum Learning:       {'Enabled (starts easy, widens on >80% success)' if is_curriculum else 'Disabled'}")
+    print(f"Wind Strength Setting:     {wind_strength:.2f} ({'Enabled' if wind_strength > 0 or sample_each_episode else 'Disabled'})")
+    print(f"Sensor Noise Setting:      {sensor_noise:.2f} ({'Enabled' if sensor_noise > 0 or sample_each_episode else 'Disabled'})")
+    print(f"Mass Randomization:        {mass_randomization:.2f}")
     print(f"TensorBoard Log Dir:       {runs_dir}")
     print(f"Model Checkpoint Dir:      {models_dir}")
     print("=" * 70 + "\n")
@@ -286,6 +364,10 @@ def train(args: argparse.Namespace) -> tuple[PPO, dict[str, Any]]:
             sensor_noise=sensor_noise,
             mass_randomization=mass_randomization,
             randomize_start=randomize_start,
+            wide_start=wide_start,
+            curriculum=is_curriculum,
+            curriculum_level=0.0 if is_curriculum else 1.0,
+            sample_random_params_each_episode=sample_each_episode,
         )
         for i in range(args.n_envs)
     ]
@@ -318,7 +400,18 @@ def train(args: argparse.Namespace) -> tuple[PPO, dict[str, Any]]:
             verbose=1,
         )
 
-        callback_list = CallbackList([landing_cb, checkpoint_cb])
+        callbacks: list[BaseCallback] = [landing_cb, checkpoint_cb]
+        if is_curriculum:
+            curriculum_cb = CurriculumCallback(
+                landing_cb=landing_cb,
+                threshold=0.80,
+                min_episodes=20,
+                step_increment=0.25,
+                verbose=1,
+            )
+            callbacks.append(curriculum_cb)
+
+        callback_list = CallbackList(callbacks)
 
         # Execute training loop
         model.learn(
@@ -360,6 +453,8 @@ def train(args: argparse.Namespace) -> tuple[PPO, dict[str, Any]]:
     print(f"Total Steps Trained:       {model.num_timesteps:,} / {args.total_steps:,}")
     print(f"Parallel Environments:     {args.n_envs}")
     print(f"Configuration:             {'1D Vertical' if args.vertical_only else 'Full 2D Planar'}")
+    if is_curriculum:
+        print(f"Curriculum Final Level:    {curriculum_cb.current_level:.2f} / 1.00")
     print(f"Random Seed:               {args.seed}")
     print("-" * 70)
     print(f"Total Episodes Completed:  {completed_episodes:,}")
