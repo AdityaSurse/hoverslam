@@ -135,6 +135,7 @@ class HoverSlamEnv(gym.Env):
         sample_random_params_each_episode: bool = False,
         render_mode: str | None = None,
         reward_weights: dict[str, float] | None = None,
+        use_kalman: bool = False,
     ) -> None:
         super().__init__()
 
@@ -148,6 +149,7 @@ class HoverSlamEnv(gym.Env):
         self.curriculum_level = float(curriculum_level) if curriculum else 1.0
         self.sample_random_params_each_episode = bool(sample_random_params_each_episode)
         self.render_mode = render_mode
+        self.use_kalman = bool(use_kalman)
 
         # Base configuration parameters
         self._base_wind_strength = self.wind_strength
@@ -196,6 +198,15 @@ class HoverSlamEnv(gym.Env):
         # Matplotlib rendering cache
         self.fig = None
         self.ax = None
+
+        # Kalman state estimator
+        self.kalman_filter = None
+        if self.use_kalman:
+            from estimation.kalman import HoverSlamKalmanFilter
+            self.kalman_filter = HoverSlamKalmanFilter(
+                dt=self.dt,
+                sensor_noise=self.sensor_noise,
+            )
 
     def set_curriculum_level(self, level: float) -> None:
         """Update curriculum difficulty level in [0.0, 1.0]."""
@@ -378,6 +389,15 @@ class HoverSlamEnv(gym.Env):
         self.prev_error = self._compute_error(self.state)
 
         obs = self._get_obs()
+        if self.use_kalman:
+            if self.kalman_filter is None:
+                from estimation.kalman import HoverSlamKalmanFilter
+                self.kalman_filter = HoverSlamKalmanFilter(
+                    dt=self.dt,
+                    sensor_noise=self.sensor_noise,
+                )
+            obs = self.kalman_filter.reset_from_obs(obs, sensor_noise=self.sensor_noise)
+
         info = {
             "landed": False,
             "touchdown_vy": None,
@@ -486,6 +506,9 @@ class HoverSlamEnv(gym.Env):
             truncated = True
 
         obs = self._get_obs()
+        if self.use_kalman and self.kalman_filter is not None:
+            obs = self.kalman_filter.filter_obs(obs, action=self.prev_action, dt=self.dt)
+
         info = {
             "landed": landed,
             "touchdown_vy": float(self.state[IDX_VY]) if touchdown else None,

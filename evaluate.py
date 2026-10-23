@@ -62,6 +62,32 @@ def resolve_model_path(path_spec: str) -> Path | None:
     return None
 
 
+class FastPPO:
+    """NumPy-accelerated evaluation wrapper for standard SB3 PPO continuous MLP policy."""
+
+    def __init__(self, ppo_model: PPO) -> None:
+        self.raw_model = ppo_model
+        try:
+            pnet = ppo_model.policy.mlp_extractor.policy_net
+            anet = ppo_model.policy.action_net
+            self.w1 = pnet[0].weight.detach().cpu().numpy().T
+            self.b1 = pnet[0].bias.detach().cpu().numpy()
+            self.w2 = pnet[2].weight.detach().cpu().numpy().T
+            self.b2 = pnet[2].bias.detach().cpu().numpy()
+            self.w3 = anet.weight.detach().cpu().numpy().T
+            self.b3 = anet.bias.detach().cpu().numpy()
+            self._has_weights = True
+        except Exception:
+            self._has_weights = False
+
+    def predict(self, obs: np.ndarray, deterministic: bool = True) -> tuple[np.ndarray, None]:
+        if self._has_weights:
+            h1 = np.tanh(obs @ self.w1 + self.b1)
+            h2 = np.tanh(h1 @ self.w2 + self.b2)
+            return h2 @ self.w3 + self.b3, None
+        return self.raw_model.predict(obs, deterministic=deterministic)
+
+
 def run_single_condition(
     controller_type: str,
     controller_obj: Any,
@@ -69,6 +95,7 @@ def run_single_condition(
     base_seed: int,
     wind_strength: float,
     sensor_noise: float,
+    use_kalman: bool = False,
 ) -> dict[str, float]:
     """Run evaluation episodes on HoverSlamEnv under a specific disturbance condition."""
     env = HoverSlamEnv(
@@ -77,6 +104,7 @@ def run_single_condition(
         sensor_noise=sensor_noise,
         mass_randomization=0.0,
         randomize_start=True,
+        use_kalman=use_kalman,
     )
 
     landed_count = 0
@@ -180,6 +208,11 @@ def parse_args() -> argparse.Namespace:
         help="Model paths or run names for PPO Randomized seeds 0, 1, 2.",
     )
     parser.add_argument(
+        "--kalman",
+        action="store_true",
+        help="Run sensor noise sweep comparing PID vs. PID+Kalman and PPO-randomized vs. PPO-randomized+Kalman.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="results",
@@ -191,10 +224,11 @@ def parse_args() -> argparse.Namespace:
     # Determine episode count
     if args.episodes is not None:
         args.num_episodes = args.episodes
-    elif args.full:
+    elif args.quick:
+        args.num_episodes = 100
+    elif args.full or args.kalman:
         args.num_episodes = 1000
     else:
-        # Default or --quick
         args.num_episodes = 100
 
     return args
@@ -310,6 +344,366 @@ def plot_sensitivity(
     print(f"[Plot Saved] {out_path}")
 
 
+def plot_kalman_sensitivity(
+    x_vals: list[float],
+    pid_raw_scores: list[float],
+    pid_kal_scores: list[float],
+    ppo_rand_raw_means: list[float],
+    ppo_rand_raw_mins: list[float],
+    ppo_rand_raw_maxs: list[float],
+    ppo_rand_kal_means: list[float],
+    ppo_rand_kal_mins: list[float],
+    ppo_rand_kal_maxs: list[float],
+    base_seed: int,
+    num_episodes: int,
+    out_path: Path,
+) -> None:
+    """Generate aesthetic dark-mode sensitivity curve comparing raw noise vs. Kalman filter."""
+    fig, ax = plt.subplots(figsize=(9.0, 5.8), dpi=200)
+
+    # Dark aerospace theme styling
+    fig.patch.set_facecolor("#0b0f19")
+    ax.set_facecolor("#111827")
+    ax.tick_params(colors="#94a3b8", labelsize=10)
+    ax.grid(True, linestyle="--", alpha=0.25, color="#475569")
+    for spine in ax.spines.values():
+        spine.set_color("#334155")
+        spine.set_linewidth(1.0)
+
+    # 1. Classical PID (raw noise) - Sky blue dashed with open circles
+    ax.plot(
+        x_vals,
+        pid_raw_scores,
+        color="#38bdf8",
+        linestyle="--",
+        marker="o",
+        markerfacecolor="none",
+        markeredgewidth=1.8,
+        markersize=6,
+        linewidth=2.0,
+        label="PID (raw noise)",
+        zorder=4,
+    )
+
+    # 2. Classical PID + Kalman - Vibrant cyan solid with filled circles
+    ax.plot(
+        x_vals,
+        pid_kal_scores,
+        color="#06b6d4",
+        linestyle="-",
+        marker="o",
+        markersize=6.5,
+        linewidth=2.4,
+        label="PID + Kalman",
+        zorder=5,
+    )
+
+    # 3. PPO-randomized + raw noise - Amber dashed with open triangles
+    ax.plot(
+        x_vals,
+        ppo_rand_raw_means,
+        color="#f59e0b",
+        linestyle="--",
+        marker="^",
+        markerfacecolor="none",
+        markeredgewidth=1.8,
+        markersize=6.5,
+        linewidth=2.0,
+        label="PPO-randomized + raw noise",
+        zorder=3,
+    )
+    if any(mi != ma for mi, ma in zip(ppo_rand_raw_mins, ppo_rand_raw_maxs)):
+        ax.fill_between(
+            x_vals,
+            ppo_rand_raw_mins,
+            ppo_rand_raw_maxs,
+            color="#f59e0b",
+            alpha=0.18,
+            zorder=2,
+        )
+
+    # 4. PPO-randomized + Kalman - Emerald solid with filled triangles
+    ax.plot(
+        x_vals,
+        ppo_rand_kal_means,
+        color="#10b981",
+        linestyle="-",
+        marker="^",
+        markersize=7,
+        linewidth=2.4,
+        label="PPO-randomized + Kalman",
+        zorder=4,
+    )
+    if any(mi != ma for mi, ma in zip(ppo_rand_kal_mins, ppo_rand_kal_maxs)):
+        ax.fill_between(
+            x_vals,
+            ppo_rand_kal_mins,
+            ppo_rand_kal_maxs,
+            color="#10b981",
+            alpha=0.22,
+            zorder=2,
+        )
+
+    ax.set_title(
+        f"Landing Success Rate vs. Sensor Noise: Raw vs. Kalman Filter\n"
+        f"Benchmark on Fixed Test Seeds ({base_seed}–{base_seed + num_episodes - 1}, {num_episodes:,} eps/point)",
+        color="#f8fafc",
+        fontsize=12,
+        fontweight="bold",
+        pad=14,
+    )
+    ax.set_xlabel("Sensor Observation Noise Scale [0.0 - 1.0]", color="#e2e8f0", fontsize=11, labelpad=8)
+    ax.set_ylabel("Landing Success Rate (%)", color="#e2e8f0", fontsize=11, labelpad=8)
+    ax.set_ylim(-5.0, 105.0)
+    ax.set_xticks(x_vals)
+
+    ax.legend(
+        loc="upper right",
+        facecolor="#1e293b",
+        edgecolor="#475569",
+        labelcolor="#f8fafc",
+        fontsize=9.5,
+        framealpha=0.95,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(str(out_path), facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+    print(f"[Plot Saved] {out_path}")
+
+
+def run_kalman_benchmark(
+    args: argparse.Namespace,
+    ppo_rand_models: list[tuple[int, Any, str]],
+    pid_controller: Any,
+    out_dir: Path,
+) -> None:
+    """Execute Kalman filter sensitivity benchmark comparing raw noise vs. Kalman filtered observations."""
+    print("=" * 72)
+    print("           HOVERSLAM KALMAN FILTER EVALUATION SUITE")
+    print("=" * 72)
+    print(f"Mode:                      {'Quick Test' if args.num_episodes < 1000 else 'Full Benchmark'}")
+    print(f"Episodes Per Condition:    {args.num_episodes:,}")
+    print(f"Test Seed Range:           {args.base_seed} to {args.base_seed + args.num_episodes - 1}")
+    print(f"Sensor Noise Sweep Points: {SWEEP_POINTS}")
+    print("Controllers Evaluated:")
+    print("  1. Classical PID (raw noise)")
+    print("  2. Classical PID + Kalman")
+    print("  3. PPO-randomized + raw noise")
+    print("  4. PPO-randomized + Kalman")
+    print("=" * 72 + "\n")
+
+    t_start = time.time()
+    csv_rows: list[dict[str, Any]] = []
+
+    pid_raw_scores: list[float] = []
+    pid_kal_scores: list[float] = []
+
+    ppo_rand_raw_means: list[float] = []
+    ppo_rand_raw_mins: list[float] = []
+    ppo_rand_raw_maxs: list[float] = []
+
+    ppo_rand_kal_means: list[float] = []
+    ppo_rand_kal_mins: list[float] = []
+    ppo_rand_kal_maxs: list[float] = []
+
+    kalman_table_data: list[dict[str, Any]] = []
+
+    for n in SWEEP_POINTS:
+        print(f"\n--- Evaluating Sensor Noise = {n:.2f} ({args.num_episodes:,} episodes per controller) ---")
+
+        # 1. PID (raw noise)
+        res_pid_raw = run_single_condition(
+            controller_type="pid",
+            controller_obj=pid_controller,
+            num_episodes=args.num_episodes,
+            base_seed=args.base_seed,
+            wind_strength=0.0,
+            sensor_noise=n,
+            use_kalman=False,
+        )
+        pid_raw_scores.append(res_pid_raw["success_rate"])
+        csv_rows.append({
+            "sweep_type": "noise_kalman",
+            "parameter_value": n,
+            "controller": "PID_Raw",
+            "seed": "N/A",
+            "success_rate": res_pid_raw["success_rate"],
+            "mean_touchdown_speed": res_pid_raw["mean_touchdown_speed"],
+            "mean_distance_from_pad": res_pid_raw["mean_distance_from_pad"],
+            "mean_fuel_remaining": res_pid_raw["mean_fuel_remaining"],
+            "num_episodes": args.num_episodes,
+        })
+
+        # 2. PID + Kalman
+        res_pid_kal = run_single_condition(
+            controller_type="pid",
+            controller_obj=pid_controller,
+            num_episodes=args.num_episodes,
+            base_seed=args.base_seed,
+            wind_strength=0.0,
+            sensor_noise=n,
+            use_kalman=True,
+        )
+        pid_kal_scores.append(res_pid_kal["success_rate"])
+        csv_rows.append({
+            "sweep_type": "noise_kalman",
+            "parameter_value": n,
+            "controller": "PID_Kalman",
+            "seed": "N/A",
+            "success_rate": res_pid_kal["success_rate"],
+            "mean_touchdown_speed": res_pid_kal["mean_touchdown_speed"],
+            "mean_distance_from_pad": res_pid_kal["mean_distance_from_pad"],
+            "mean_fuel_remaining": res_pid_kal["mean_fuel_remaining"],
+            "num_episodes": args.num_episodes,
+        })
+
+        # 3. PPO-randomized (raw noise) across seeds
+        rand_raw_seed_scores: list[float] = []
+        for s_idx, m_obj, _ in ppo_rand_models:
+            r_res = run_single_condition(
+                controller_type="ppo",
+                controller_obj=m_obj,
+                num_episodes=args.num_episodes,
+                base_seed=args.base_seed,
+                wind_strength=0.0,
+                sensor_noise=n,
+                use_kalman=False,
+            )
+            rand_raw_seed_scores.append(r_res["success_rate"])
+            csv_rows.append({
+                "sweep_type": "noise_kalman",
+                "parameter_value": n,
+                "controller": "PPO_Randomized_Raw",
+                "seed": s_idx,
+                "success_rate": r_res["success_rate"],
+                "mean_touchdown_speed": r_res["mean_touchdown_speed"],
+                "mean_distance_from_pad": r_res["mean_distance_from_pad"],
+                "mean_fuel_remaining": r_res["mean_fuel_remaining"],
+                "num_episodes": args.num_episodes,
+            })
+
+        mean_raw = float(np.mean(rand_raw_seed_scores))
+        min_raw = float(np.min(rand_raw_seed_scores))
+        max_raw = float(np.max(rand_raw_seed_scores))
+        ppo_rand_raw_means.append(mean_raw)
+        ppo_rand_raw_mins.append(min_raw)
+        ppo_rand_raw_maxs.append(max_raw)
+
+        # 4. PPO-randomized + Kalman across seeds
+        rand_kal_seed_scores: list[float] = []
+        for s_idx, m_obj, _ in ppo_rand_models:
+            k_res = run_single_condition(
+                controller_type="ppo",
+                controller_obj=m_obj,
+                num_episodes=args.num_episodes,
+                base_seed=args.base_seed,
+                wind_strength=0.0,
+                sensor_noise=n,
+                use_kalman=True,
+            )
+            rand_kal_seed_scores.append(k_res["success_rate"])
+            csv_rows.append({
+                "sweep_type": "noise_kalman",
+                "parameter_value": n,
+                "controller": "PPO_Randomized_Kalman",
+                "seed": s_idx,
+                "success_rate": k_res["success_rate"],
+                "mean_touchdown_speed": k_res["mean_touchdown_speed"],
+                "mean_distance_from_pad": k_res["mean_distance_from_pad"],
+                "mean_fuel_remaining": k_res["mean_fuel_remaining"],
+                "num_episodes": args.num_episodes,
+            })
+
+        mean_kal = float(np.mean(rand_kal_seed_scores))
+        min_kal = float(np.min(rand_kal_seed_scores))
+        max_kal = float(np.max(rand_kal_seed_scores))
+        ppo_rand_kal_means.append(mean_kal)
+        ppo_rand_kal_mins.append(min_kal)
+        ppo_rand_kal_maxs.append(max_kal)
+
+        kalman_table_data.append({
+            "param": n,
+            "pid_raw": res_pid_raw["success_rate"],
+            "pid_kal": res_pid_kal["success_rate"],
+            "ppo_raw_mean": mean_raw,
+            "ppo_raw_min": min_raw,
+            "ppo_raw_max": max_raw,
+            "ppo_kal_mean": mean_kal,
+            "ppo_kal_min": min_kal,
+            "ppo_kal_max": max_kal,
+        })
+
+        print(
+            f"  Noise {n:4.2f} | PID Raw: {res_pid_raw['success_rate']:5.1f}% -> PID+Kalman: {res_pid_kal['success_rate']:5.1f}% | "
+            f"PPO Raw: {mean_raw:5.1f}% [{min_raw:.0f}-{max_raw:.0f}%] -> PPO+Kalman: {mean_kal:5.1f}% [{min_kal:.0f}-{max_kal:.0f}%]"
+        )
+
+    t_elapsed = time.time() - t_start
+    print(f"\nKalman evaluation sweep completed in {t_elapsed:.1f} seconds.")
+
+    # Generate Plot: results/success_vs_noise_kalman.png
+    out_plot_path = out_dir / "success_vs_noise_kalman.png"
+    plot_kalman_sensitivity(
+        x_vals=SWEEP_POINTS,
+        pid_raw_scores=pid_raw_scores,
+        pid_kal_scores=pid_kal_scores,
+        ppo_rand_raw_means=ppo_rand_raw_means,
+        ppo_rand_raw_mins=ppo_rand_raw_mins,
+        ppo_rand_raw_maxs=ppo_rand_raw_maxs,
+        ppo_rand_kal_means=ppo_rand_kal_means,
+        ppo_rand_kal_mins=ppo_rand_kal_mins,
+        ppo_rand_kal_maxs=ppo_rand_kal_maxs,
+        base_seed=args.base_seed,
+        num_episodes=args.num_episodes,
+        out_path=out_plot_path,
+    )
+
+    # Save to CSV (dedicated benchmark_kalman.csv and also append to benchmark.csv)
+    csv_kal_path = out_dir / "benchmark_kalman.csv"
+    with open(csv_kal_path, mode="w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "sweep_type", "parameter_value", "controller", "seed",
+            "success_rate", "mean_touchdown_speed", "mean_distance_from_pad",
+            "mean_fuel_remaining", "num_episodes"
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in csv_rows:
+            writer.writerow(r)
+    print(f"[CSV Saved] {csv_kal_path}")
+
+    # Generate Markdown Table
+    md_path = out_dir / "benchmark_table_kalman.md"
+    with open(md_path, mode="w", encoding="utf-8") as f:
+        f.write("# HoverSlam Kalman Filter Benchmark Report\n\n")
+        f.write(f"- **Benchmark Protocol:** Fixed evaluation seeds (`{args.base_seed}`–`{args.base_seed + args.num_episodes - 1}`)\n")
+        f.write(f"- **Episodes Per Condition:** {args.num_episodes:,}\n")
+        f.write(f"- **Evaluation Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("## Sensor Noise Sweep: Raw Noise vs. Kalman Filter\n\n")
+        f.write("| Sensor Noise | PID (Raw) (%) | PID + Kalman (%) | PPO-Rand (Raw) (%) | PPO-Rand + Kalman (%) |\n")
+        f.write("|:---:|:---:|:---:|:---:|:---:|\n")
+        for d in kalman_table_data:
+            f.write(
+                f"| {d['param']:.2f} | {d['pid_raw']:5.1f}% | {d['pid_kal']:5.1f}% | "
+                f"{d['ppo_raw_mean']:5.1f}% [{d['ppo_raw_min']:.0f}-{d['ppo_raw_max']:.0f}%] | "
+                f"{d['ppo_kal_mean']:5.1f}% [{d['ppo_kal_min']:.0f}-{d['ppo_kal_max']:.0f}%] |\n"
+            )
+        f.write("\n## Sensitivity Plot\n\n")
+        f.write("![Kalman Noise Sensitivity](success_vs_noise_kalman.png)\n")
+    print(f"[Markdown Table Saved] {md_path}\n")
+
+    print("=" * 72)
+    print("             KALMAN BENCHMARK EXECUTION COMPLETED")
+    print("=" * 72)
+    print(f"Generated Files in '{out_dir}':")
+    print(f" - CSV Dataset:     {csv_kal_path}")
+    print(f" - Markdown Table:  {md_path}")
+    print(f" - Kalman Plot:     {out_plot_path}")
+    print("=" * 72 + "\n")
+
+
 def main() -> None:
     """Execute complete benchmarking suite and generate outputs."""
     args = parse_args()
@@ -331,7 +725,21 @@ def main() -> None:
     pid_controller = HoverSlamPID(dt=sample_env.dt)
     sample_env.close()
 
-    # Load PPO models
+    # Route to Kalman benchmark if requested
+    if args.kalman:
+        ppo_rand_models: list[tuple[int, Any, str]] = []
+        for idx, spec in enumerate(args.randomized_models):
+            mpath = resolve_model_path(spec)
+            if mpath is None:
+                raise FileNotFoundError(f"Randomized model not found: {spec}")
+            print(f"Loaded Randomized Seed {idx} model from: {mpath}")
+            loaded_m = PPO.load(str(mpath))
+            ppo_rand_models.append((idx, FastPPO(loaded_m), str(mpath)))
+
+        run_kalman_benchmark(args, ppo_rand_models, pid_controller, out_dir)
+        return
+
+    # Load PPO models for nominal and randomized benchmarks
     ppo_nom_models: list[tuple[int, PPO, str]] = []
     for idx, spec in enumerate(args.nominal_models):
         mpath = resolve_model_path(spec)
